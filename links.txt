@@ -1,0 +1,2 @@
+# Add one wallpaper URL per line
+# https://wallhaven.cc/w/example
