@@ -1,4 +1,6 @@
+import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from selenium import webdriver
@@ -14,6 +16,14 @@ HEIGHT = 1800
 LINKS_FILE = "links.txt"
 DOWNLOAD_DIR = "downloads"
 DOWNLOAD_TIMEOUT_SECONDS = 180
+MAX_WORKERS = 5
+
+
+def wallpaper_id(url: str) -> str:
+    m = re.search(r"/w/([a-z0-9]+)$", url)
+    if not m:
+        raise ValueError(f"Cannot extract wallpaper ID from {url}")
+    return m.group(1)
 
 
 def read_links(path: Path) -> list[str]:
@@ -72,11 +82,13 @@ def active_downloads(download_dir: Path) -> list[Path]:
 
 
 def changed_downloads(
-    download_dir: Path, before: dict[Path, tuple[int, float]]
+    download_dir: Path, before: dict[Path, tuple[int, float]], expected_suffix: str = ""
 ) -> list[Path]:
     changed = []
     for path in download_dir.iterdir():
         if not path.is_file() or path in active_downloads(download_dir):
+            continue
+        if expected_suffix and expected_suffix not in path.name:
             continue
 
         stat = path.stat()
@@ -87,7 +99,11 @@ def changed_downloads(
     return changed
 
 
-def wait_for_download(download_dir: Path, before: dict[Path, tuple[int, float]]) -> Path:
+def wait_for_download(
+    download_dir: Path,
+    before: dict[Path, tuple[int, float]],
+    expected_suffix: str = "",
+) -> Path:
     deadline = time.monotonic() + DOWNLOAD_TIMEOUT_SECONDS
     last_candidate: Path | None = None
     last_size = -1
@@ -99,7 +115,7 @@ def wait_for_download(download_dir: Path, before: dict[Path, tuple[int, float]])
             time.sleep(0.5)
             continue
 
-        candidates = changed_downloads(download_dir, before)
+        candidates = changed_downloads(download_dir, before, expected_suffix)
         if candidates:
             candidate = max(candidates, key=lambda path: path.stat().st_mtime)
             size = candidate.stat().st_size
@@ -125,6 +141,7 @@ def download_wallpaper(
     download_dir: Path,
     width: int,
     height: int,
+    expected_suffix: str,
 ) -> Path:
     print(f"Opening {url}")
     driver.get(url)
@@ -158,9 +175,24 @@ def download_wallpaper(
     except TimeoutException:
         pass
 
-    downloaded = wait_for_download(download_dir, before)
+    downloaded = wait_for_download(download_dir, before, expected_suffix)
     print(f"Downloaded {downloaded.name}")
     return downloaded
+
+
+def download_one(url: str, download_dir: Path) -> tuple[str, Path | None, str | None]:
+    driver = None
+    try:
+        wid = wallpaper_id(url)
+        driver = make_driver(download_dir)
+        wait = WebDriverWait(driver, 30)
+        path = download_wallpaper(driver, wait, url, download_dir, WIDTH, HEIGHT, wid)
+        return (url, path, None)
+    except Exception as e:
+        return (url, None, str(e))
+    finally:
+        if driver:
+            driver.quit()
 
 
 if __name__ == "__main__":
@@ -168,17 +200,16 @@ if __name__ == "__main__":
     download_dir.mkdir(parents=True, exist_ok=True)
 
     links = read_links(Path(LINKS_FILE))
+    print(f"Processing {len(links)} wallpaper(s) with {MAX_WORKERS} parallel workers")
 
-    driver = make_driver(download_dir)
-    wait = WebDriverWait(driver, 30)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(download_one, url, download_dir) for url in links]
 
-    try:
-        for url in links:
-            try:
-                download_wallpaper(driver, wait, url, download_dir, WIDTH, HEIGHT)
-            except Exception as e:
-                print(f"Failed {url}: {e}")
-    finally:
-        driver.quit()
+        for future in as_completed(futures):
+            url, path, error = future.result()
+            if error:
+                print(f"Failed {url}: {error}")
+            else:
+                print(f"Completed {url} -> {path.name}")
 
-    print(f"\nFinished downloading {len(links)} wallpaper(s) to {download_dir.resolve()}")
+    print(f"\nFinished. Downloaded files are in {download_dir.resolve()}")
